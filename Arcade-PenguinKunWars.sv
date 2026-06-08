@@ -153,14 +153,20 @@ module emu
 	// 1 - D-/TX
 	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
-	input   [6:0] USER_IN,
-	output  [6:0] USER_OUT,
-	
-	input         OSD_STATUS	
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USER_OSD + per-pin push-pull mask, USER_IO widened to 8 bits
+	output        USER_OSD,
+	output  [7:0] USER_PP,
+	input   [7:0] USER_IN,
+	output  [7:0] USER_OUT,
+	// [MiSTer-DB9 END]
+
+	input         OSD_STATUS
 );
 
 assign ADC_BUS  = 'Z;
-assign USER_OUT = '1;
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USER_PP driven by wrapper; USER_OUT driven by joydb (USER_OUT_DRIVE) below
+assign USER_PP = USER_PP_DRIVE;
+// [MiSTer-DB9 END]
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
@@ -173,8 +179,6 @@ assign VGA_SCALER  = 0;
 assign VGA_DISABLE = 0;
 assign HDMI_FREEZE = 0;
 
-assign USER_OUT  = '1;
-
 assign LED_USER  = ioctl_download;
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
@@ -184,7 +188,58 @@ assign VIDEO_ARY = status[1] ? 8'd9  : 8'd3;
 
 assign BUTTONS = 0;
 
-`include "build_id.v" 
+///////////////////////////////////////////////////
+
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joydb wrapper
+wire         CLK_JOY = CLK_50M;                 // Assign clock between 40-50Mhz
+wire   [1:0] joy_type_raw    = status[127:126]; // 0=Off, 1=Saturn, 2=DB9MD, 3=DB15
+wire         joy_2p          = status[125];
+// SNAC cores: replace 1'b0 with the core's SNAC enable expression so SNAC
+// preempts the joydb wrapper on shared USER_IO pins. Default 1'b0 is no-op.
+wire         snac_active     = 1'b0;
+// MT32-pi cores on primary USER_IO: replace 1'b0 with the core's MT32-active
+// expression. Default 1'b0 is no-op (PenguinKunWars has no MT32-pi support).
+wire         mt32_primary_active = 1'b0;
+wire   [1:0] joy_type        = snac_active ? 2'd0 : joy_type_raw;
+wire         joy_db9md_en    = (joy_type == 2'd2);
+wire         joy_db15_en     = (joy_type == 2'd3);
+wire         joy_any_en      = |joy_type;
+// [MiSTer-DB9 END]
+
+// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
+wire         saturn_unlocked;                   // driven by hps_io UIO_DB9_KEY (0xFE)
+// [MiSTer-DB9-Pro END]
+
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joydb wrapper wires + instance
+wire   [7:0] USER_OUT_DRIVE;
+wire   [7:0] USER_PP_DRIVE;
+wire  [15:0] joydb_1, joydb_2;
+wire         joydb_1ena, joydb_2ena;
+wire  [15:0] joy_raw_payload;
+
+joydb joydb (
+  .clk             ( CLK_JOY         ),
+  .USER_IN         ( USER_IN         ),
+  .OSD_STATUS          ( OSD_STATUS          ),
+  .snac_active         ( snac_active         ),
+  .mt32_primary_active ( mt32_primary_active ),
+  .joy_type        ( joy_type        ),
+  .joy_2p          ( joy_2p          ),
+  .saturn_unlocked ( saturn_unlocked ),
+  .USER_OUT_DRIVE  ( USER_OUT_DRIVE  ),
+  .USER_PP_DRIVE   ( USER_PP_DRIVE   ),
+  .USER_OSD        ( USER_OSD        ),
+  .joydb_1         ( joydb_1         ),
+  .joydb_2         ( joydb_2         ),
+  .joydb_1ena      ( joydb_1ena      ),
+  .joydb_2ena      ( joydb_2ena      ),
+  .joy_raw         ( joy_raw_payload )
+);
+
+assign USER_OUT = USER_OUT_DRIVE;
+// [MiSTer-DB9 END]
+
+`include "build_id.v"
 
 localparam CONF_STR = {
 	"A.PenguinKunWars;;",
@@ -198,6 +253,10 @@ localparam CONF_STR = {
 	"-;",
 	"O8,Excite Mode,Off,On;",
 	"-;",
+	// [MiSTer-DB9-Pro BEGIN] - Saturn-first joy_type (canonical bit notation)
+	"O[127:126],UserIO Joystick,Off,Saturn,DB9MD,DB15;",
+	"O[125],UserIO Players, 1 Player,2 Players;",
+	// [MiSTer-DB9-Pro END]
 	"R0,Reset;",
 	"J1,Throw,Start 1P,Start 2P,Coin;",
 	"jn,A,Start,Select,L;",
@@ -226,7 +285,9 @@ pll pll
 
 ///////////////////////////////////////////////////
 
-wire [31:0] status;
+// [MiSTer-DB9 BEGIN] - widened to 128 bits for joy_type at [127:126], joy_2p at [125]
+wire [127:0] status;
+// [MiSTer-DB9 END]
 wire  [1:0] buttons;
 wire        forced_scandoubler;
 wire        direct_video;
@@ -237,7 +298,9 @@ wire  [7:0] ioctl_dout;
 wire  [7:0] ioctl_index;
 
 wire [10:0] ps2_key;
-wire [15:0] joystk1, joystk2;
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: rename USB joystick wires; joystk1/joystk2 redefined from joydb below
+wire [15:0] joystk1_USB, joystk2_USB;
+// [MiSTer-DB9 END]
 wire [15:0] joystick_analog_0;
 wire [15:0] joystick_analog_1;
 wire [21:0] gamma_bus;
@@ -260,13 +323,42 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_dout(ioctl_dout),
 	.ioctl_index(ioctl_index),
 
-	.joystick_0(joystk1),
-	.joystick_1(joystk2),
+	.joystick_0(joystk1_USB),
+	.joystick_1(joystk2_USB),
 	.joystick_l_analog_0(joystick_analog_0),
-	.joystick_l_analog_1(joystick_analog_1),	
+	.joystick_l_analog_1(joystick_analog_1),
 
-	.ps2_key(ps2_key)
+	.ps2_key(ps2_key),
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joy_raw
+	.joy_raw(OSD_STATUS ? joy_raw_payload : 16'b0),
+	// [MiSTer-DB9 END]
+	// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
+	.saturn_unlocked(saturn_unlocked)
+	// [MiSTer-DB9-Pro END]
 );
+
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: remux joydb -> joystk1/joystk2
+// Penguin-Kun Wars USB joystick layout (from CONF_STR "J1,Throw,Start 1P,Start 2P,Coin"):
+//   [3:0]=UDLR, [4]=Throw(A), [5]=Start 1P, [6]=Start 2P, [7]=Coin.
+// The game is a 2-way (L/R) + single-button (Throw) title, so it fits the
+// 3-button-MD playability rule (Rule 1): every required input reaches via
+// joydb_1[10] (Start), joydb_1[6:4] (C/B/A), joydb_1[3:0] (UDLR), and Coin
+// uses the chord joydb_1[11] | (joydb_1[10] & joydb_1[5]).
+// Per-pad mapping:
+//   [7] Coin     <- joydb[11] | (joydb[10] & joydb[5])   (Mode/Select/SatR, or Start+B on 3-btn MD)
+//   [6] Start 2P <- joydb[9]  (Z) on P1, the P2 pad's own Start drives 2P via [5] -> Start 1P path
+//   [5] Start 1P <- joydb[10] (physical Start)
+//   [4] Throw    <- joydb[4]  (A)
+//   [3:0] UDLR   <- joydb[3:0]
+// [MiSTer-DB9-Pro BEGIN] - DB controllers muted while OSD is open
+wire [15:0] joystk1 = joydb_1ena ? (OSD_STATUS ? 16'b0 :
+                      {8'b0, joydb_1[11]|(joydb_1[10]&joydb_1[5]), joydb_1[9], joydb_1[10], joydb_1[4], joydb_1[3:0]})
+                      : joystk1_USB;
+wire [15:0] joystk2 = joydb_2ena ? (OSD_STATUS ? 16'b0 :
+                      {8'b0, joydb_2[11]|(joydb_2[10]&joydb_2[5]), joydb_2[9], joydb_2[10], joydb_2[4], joydb_2[3:0]})
+                      : joydb_1ena ? joystk1_USB : joystk2_USB;
+// [MiSTer-DB9-Pro END]
+// [MiSTer-DB9 END]
 
 reg [7:0] DSW[8];
 always @(posedge clk_sys) begin
